@@ -2,7 +2,7 @@
 """
 Orchestration supervisor engine managing thread execution,
 health assertions, signal traps, and Prometheus telemetry metrics exposition.
-INTEGRATED WITH: Dynamic Percentage Staking Engine (10, 15, 25, 40, 60, 90)
+INTEGRATED WITH: Flat Stake Engine (5,000 MMK) + Persistent Bankroll (100,000 MMK)
 """
 
 import time
@@ -12,6 +12,9 @@ import os
 import logging
 from prometheus_client import start_http_server
 
+# Ensure worker module is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 # Import core loop routines and internal application memory states
 from bot import (
     run_bot_cycle,
@@ -19,42 +22,56 @@ from bot import (
     initialize_bot_services,
     shutdown_bot,
     send_telegram,
+    install_log_redaction,
     LOCAL_TRACKED_MATCHES,
-    # NEW: Staking engine imports
+    # Staking engine imports
     set_staking_engine,
-    get_staking_engine,
-    get_staking_stats,
-    get_staking_status_message,
-    enable_staking,
-    reset_staking_engine,
-    STAKE_SEQUENCE,
+    FLAT_STAKE_MMK,
+    INITIAL_BANKROLL_MMK,
 )
 
-# Import the Staking Engine
-from staking_engine import StakingEngine
+# Import the Flat Stake Engine
+from staking_engine import StakingEngine, CURRENCY
 
 # Import shared metric counters to expose and manipulate state updates
 from metrics import CYCLE_COUNTER, MATCHES_TRACKED_GAUGE, API_FAILURES
 
 # Setup isolated logger namespace for supervisor context tracking
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "bot_activity.log")
+
+_log_handlers = [logging.StreamHandler()]
+try:
+    _log_handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
+except OSError as exc:  # pragma: no cover - filesystem dependent
+    print(f"⚠️ Could not open log file {LOG_FILE!r} ({exc}); logging to stdout only.")
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("bot_activity.log"), logging.StreamHandler()]
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("BetBot.Supervisor")
 
+# Strip bot credentials from every log line (covers requests errors that embed
+# the Telegram token in the request URL).
+install_log_redaction()
+
 # --- CONSTRAINTS ---
-WATCHDOG_LIMIT = 300
-REBOOT_LIMIT = 86400
-HEARTBEAT_LIMIT = 86400
-STATUS_UPDATE_INTERVAL = 86400  # Send staking status every 30 cycles
+WATCHDOG_LIMIT = int(os.getenv("WATCHDOG_LIMIT", "300"))
+REBOOT_LIMIT = int(os.getenv("REBOOT_LIMIT", "86400"))
+# Periodic status check message: exactly 2 times per day by default (every 12h).
+STATUS_INTERVAL_SECONDS = int(os.getenv("STATUS_INTERVAL_SECONDS", str(12 * 3600)))
 METRICS_PORT = int(os.getenv("PORT", 8000))
+# Minimum gap between watchdog-triggered recovery handshakes, so a burst of
+# slow cycles cannot trigger recovery storms.
+RECOVERY_COOLDOWN = int(os.getenv("RECOVERY_COOLDOWN", "600"))
 
 RUNNING = True
 LAST_REBOOT = time.time()
-LAST_HEARTBEAT = time.time()
-CYCLE_COUNT = 0
+LAST_STATUS = time.time()
+LAST_RECOVERY = 0.0
 
 # ============================================================
 # GLOBAL STAKING ENGINE
@@ -80,30 +97,6 @@ def send_staking_status():
     else:
         send_telegram("⚠️ Staking engine not initialized.")
 
-def send_enhanced_heartbeat():
-    """Send an enhanced heartbeat with staking statistics."""
-    if staking_engine:
-        stats = staking_engine.get_stats()
-        heartbeat_msg = (
-            f"💓 **Heartbeat Pulse:**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Cached Matches: {len(LOCAL_TRACKED_MATCHES)}\n"
-            f"💰 Current Stake: {stats['current_stake']}\n"
-            f"📈 Step: {stats['current_step']+1}/{len(STAKE_SEQUENCE)}\n"
-            f"✅ Wins: {stats['total_wins']}\n"
-            f"❌ Losses: {stats['total_losses']}\n"
-            f"📊 Win Rate: {stats['win_rate']}\n"
-            f"📈 Profit: {stats['total_profit']}\n"
-            f"💰 Bankroll: {stats['current_bankroll']}\n"
-            f"🔥 Streak: {stats['current_streak']}\n"
-            f"⏸️ Paused: {stats['is_paused']}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔄 {staking_engine.get_current_step_display()}"
-        )
-        send_telegram(heartbeat_msg)
-    else:
-        send_telegram(f"💓 **Heartbeat Pulse:** Bot Status: Active\n📊 Cached Matches: {len(LOCAL_TRACKED_MATCHES)}")
-
 # --------------------------------------------------
 # SYSTEM RESTORATION ROUTINES
 # --------------------------------------------------
@@ -125,10 +118,11 @@ def execute_safe_recovery_handshake() -> bool:
             logger.info("✅ Platform modules successfully recovered.")
             send_telegram("✅ Supervisor Core: Service recovery completed. Bot is back online.")
 
-            # Re-attach staking engine after recovery
+            # Re-attach staking engine after recovery (state reloaded in initialize_bot_services)
             if staking_engine:
                 set_staking_engine(staking_engine)
                 logger.info(f"📊 Staking engine re-attached: {staking_engine.get_current_step_display()}")
+                logger.info(f"💰 Bankroll: {staking_engine.current_bankroll:,.0f} {CURRENCY}")
 
             return True
         time.sleep(30)
@@ -144,21 +138,21 @@ def can_safely_reboot() -> bool:
 # APPLICATION RUNTIME ORCHESTRATION ENTRY
 # --------------------------------------------------
 def main():
-    global RUNNING, LAST_REBOOT, LAST_HEARTBEAT, CYCLE_COUNT, staking_engine
+    global RUNNING, LAST_REBOOT, LAST_STATUS, LAST_RECOVERY, staking_engine
 
     logger.info(f"🚀 INITIALIZING SUPERVISOR MANAGER ASSET PROCESS. PID={os.getpid()}")
 
     # ============================================================
-    # INITIALIZE STAKING ENGINE
+    # INITIALIZE FLAT STAKE ENGINE (persistence attached in initialize_bot_services)
     # ============================================================
-    initial_bankroll = float(os.getenv("INITIAL_BANKROLL", "1000"))
-    staking_engine = StakingEngine(initial_bankroll)
+    initial_bankroll = float(os.getenv("INITIAL_BANKROLL", str(INITIAL_BANKROLL_MMK)))
+    staking_engine = StakingEngine(initial_bankroll)  # persistence attached later
     set_staking_engine(staking_engine)
 
-    logger.info(f"📊 Dynamic Percentage Staking Engine loaded.")
-    logger.info(f"📊 Sequence: {STAKE_SEQUENCE}")
-    logger.info(f"💰 Initial Bankroll: ${initial_bankroll:.2f}")
-    logger.info(f"⚠️ Pause after {staking_engine.MAX_CONSECUTIVE_LOSSES} consecutive losses.")
+    logger.info("📊 Flat Stake Engine loaded (MMK).")
+    logger.info(f"🎯 Flat Stake: {FLAT_STAKE_MMK:,} {CURRENCY}")
+    logger.info(f"💰 Initial Bankroll: {initial_bankroll:,.0f} {CURRENCY}")
+    logger.info("🔒 Bankroll is persistent (Firestore: bot_state/primary).")
 
     # Attach kernel operational interrupt triggers
     signal.signal(signal.SIGINT, handle_shutdown_signal)
@@ -171,19 +165,19 @@ def main():
     except Exception as metrics_ex:
         logger.critical(f"💥 Failed to lock Prometheus HTTP socket port allocation: {metrics_ex}")
 
-    # Core Startup Routine
+    # Core Startup Routine (also attaches Firebase to staking engine & reloads state)
     if not initialize_bot_services():
-        logger.critical("💥 Initial core component initialization failed! Terminating Supervisor process.")
+        logger.critical("💥 Initial core component initialization failure! Terminating Supervisor process.")
         sys.exit(1)
 
     # Send startup messages
     send_telegram(
         "🚀 **BetBot Daemon Supervisor Online**\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 **Dynamic Percentage Staking Engine Active**\n"
-        f"🔄 Sequence: {' → '.join('$'+str(s) for s in STAKE_SEQUENCE)}\n"
-        f"💰 Initial Bankroll: ${initial_bankroll:.2f}\n"
-        f"⚠️ Safety: Pause after {staking_engine.MAX_CONSECUTIVE_LOSSES} consecutive losses.\n"
+        "📊 **Flat Stake Engine Active**\n"
+        f"🎯 Stake: {FLAT_STAKE_MMK:,} {CURRENCY} per bet\n"
+        f"💰 Bankroll: {staking_engine.current_bankroll:,.0f} {CURRENCY}\n"
+        f"🔒 Persistent across restarts\n"
         "━━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -195,7 +189,6 @@ def main():
     while RUNNING:
         cycle_start_time = time.time()
         CYCLE_COUNTER.inc()
-        CYCLE_COUNT += 1
 
         try:
             # Execute business logic queries
@@ -207,9 +200,21 @@ def main():
             # Watchdog Execution Time Limit Assertion
             elapsed_cycle_time = time.time() - cycle_start_time
             if elapsed_cycle_time > WATCHDOG_LIMIT:
-                logger.error(f"🚨 Watchdog breached: Process execution took {elapsed_cycle_time:.2f}s.")
-                if not execute_safe_recovery_handshake():
-                    break
+                if time.time() - LAST_RECOVERY < RECOVERY_COOLDOWN:
+                    logger.warning(
+                        "⚠️ Cycle overran watchdog (%.2fs > %ss) but recovery is "
+                        "cooling down; skipping handshake.",
+                        elapsed_cycle_time, WATCHDOG_LIMIT,
+                    )
+                else:
+                    logger.error(
+                        "🚨 Watchdog breached: cycle took %.2fs (limit %ss). "
+                        "Initiating recovery handshake.",
+                        elapsed_cycle_time, WATCHDOG_LIMIT,
+                    )
+                    LAST_RECOVERY = time.time()
+                    if not execute_safe_recovery_handshake():
+                        break
 
             # Smart Maintenance Window Assertion
             if time.time() - LAST_REBOOT > REBOOT_LIMIT:
@@ -220,14 +225,10 @@ def main():
                 else:
                     LAST_REBOOT += 300  # Shift evaluation window forward 5 minutes
 
-            # Enhanced Telegram Heartbeat Status Update
-            if time.time() - LAST_HEARTBEAT > HEARTBEAT_LIMIT:
-                send_enhanced_heartbeat()
-                LAST_HEARTBEAT = time.time()
-
-            # Send staking status update every STATUS_UPDATE_INTERVAL cycles
-            if CYCLE_COUNT % STATUS_UPDATE_INTERVAL == 0:
+            # Status check message: sent exactly twice per day (every 12h by default)
+            if time.time() - LAST_STATUS >= STATUS_INTERVAL_SECONDS:
                 send_staking_status()
+                LAST_STATUS = time.time()
 
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt received. Shutting down...")
